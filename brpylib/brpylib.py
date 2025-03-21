@@ -1487,6 +1487,8 @@ class NsxFile:
             # get current file position and set loop parameters
             datafile_pos = self.datafile.tell()
             file_offset = datafile_pos
+            print(file_offset)
+            print(packet_pts)
             mm_length = (
                 DATA_PAGING_SIZE // datafile_datapt_size
             ) * datafile_datapt_size
@@ -1657,6 +1659,355 @@ class NsxFile:
 
         # Close subset file and return success
         subset_file.close()
+        print("\n *** All subset files written to disk and closed ***")
+        return "SUCCESS"
+
+    def savesinglesubsetnsx(
+        self, elec_ids="all", start_time_s=None, file_time_s=None, file_suffix=""
+    ):
+        """
+        This function is used to save a single subset of the data based on file data start time and duration.
+
+        :param elec_ids:    [optional] {list}  List of elec_ids to extract (e.g., [13])
+        :param start_time_s: [optional] {float} Start timestamp of the subset file, in seconds (e.g. 60.0).
+        :param file_time_s: [optional] {float} Time length of data for the subset file, in seconds (e.g. 60.0).
+        :param file_suffix: [optional] {str}   Suffix to append to NSx datafile name for the subset file.  If nothing is
+                                                   passed, default will be "_subset".
+        :return: None - None of the electrodes requested exist in the data
+                 SUCCESS - The file subset is extracted and saved
+        """
+
+        # Initializations
+        elec_id_indices = []
+        start_time_s = check_starttime(start_time_s)
+        file_time_s = check_datatime(file_time_s)
+
+        file_num = 1
+        pausing = False
+        datafile_datapt_size = self.basic_header["ChannelCount"] * DATA_BYTE_SIZE
+        self.datafile.seek(0, 0)
+
+        # Run electrode id checks and set num_elecs
+        elec_ids = check_elecid(elec_ids)
+        if self.basic_header["FileSpec"] == "2.1":
+            all_elec_ids = self.basic_header["ChannelID"]
+        else:
+            all_elec_ids = [x["ElectrodeID"] for x in self.extended_headers]
+
+        if elec_ids == ELEC_ID_DEF:
+            elec_ids = all_elec_ids
+        else:
+            elec_ids = check_dataelecid(elec_ids, all_elec_ids)
+            if not elec_ids:
+                return None
+            else:
+                elec_id_indices = [all_elec_ids.index(x) for x in elec_ids]
+
+        num_elecs = len(elec_ids)
+
+        # Check timing parameters and set file_sizing accordingly
+        if start_time_s:
+            file_start_offset_size = int(
+                (num_elecs
+                * DATA_BYTE_SIZE)
+                * start_time_s
+                * self.basic_header["TimeStampResolution"]
+                / self.basic_header["Period"]
+            )
+            if self.basic_header["FileSpec"] == "2.1":
+                file_start_offset_size += 32 + 4 * num_elecs
+            else:
+                file_start_offset_size += (
+                    NSX_BASIC_HEADER_BYTES_22 + NSX_EXT_HEADER_BYTES_22 * num_elecs + 5
+            )
+        # if start offset time is 0 seconds
+        else:
+            file_start_offset_size = 0
+            file_start_offset_size = check_filesize(file_start_offset_size)
+ 
+        print(
+            "\nBased on timing request, file start offset will be {0:d} Mb".format(
+                int(file_start_offset_size / 1024**2)
+            )
+        )
+
+        file_size = int(
+            num_elecs
+            * DATA_BYTE_SIZE
+            * file_time_s
+            * self.basic_header["TimeStampResolution"]
+            / self.basic_header["Period"]
+        )
+        if self.basic_header["FileSpec"] == "2.1":
+            file_size += 32 + 4 * num_elecs
+        else:
+            file_size += (
+                NSX_BASIC_HEADER_BYTES_22 + NSX_EXT_HEADER_BYTES_22 * num_elecs + 5
+            )
+        print(
+            "\nBased on timing request, file size will be {0:d} Mb".format(
+                int(file_size / 1024**2)
+            )
+        )
+        file_size = check_filesize(file_size)
+
+        
+        # Create and open subset file as writable binary, if it already exists ask user for overwrite permission
+        file_name, file_ext = ospath.splitext(self.datafile.name)
+        if file_suffix:
+            file_name += "_" + file_suffix
+        else:
+            file_name += "_subset"
+
+        if ospath.isfile(file_name + "_000" + file_ext):
+            if "y" != input(
+                "\nFile '"
+                + file_name.split("/")[-1]
+                + "_xxx"
+                + file_ext
+                + "' already exists, overwrite [y/n]: "
+            ):
+                print("\nExiting, no overwrite, returning None")
+                return None
+            else:
+                print("\n*** Overwriting existing subset files ***")
+
+        subset_file = open(file_name + "_TEMPOFFSET" + file_ext, "wb")
+        print("\nWriting subset file: " + ospath.split(subset_file.name)[1])
+
+        # For file spec 2.1:
+        #   1) copy the first 28 bytes from the datafile (these are unchanged)
+        #   2) write subset channel count and channel ID to file
+        #   3) skip ahead in datafile the number of bytes in datafile ChannelCount(4) plus ChannelID (4*ChannelCount)
+        if self.basic_header["FileSpec"] == "2.1":
+            subset_file.write(self.datafile.read(28))
+            subset_file.write(np.array(num_elecs).astype(np.uint32).tobytes())
+            subset_file.write(np.array(elec_ids).astype(np.uint32).tobytes())
+            self.datafile.seek(4 + 4 * self.basic_header["ChannelCount"], 1)
+
+        # For file spec 2.2 and above
+        #    1) copy the first 10 bytes from the datafile (unchanged)
+        #    2) write subset bytes-in-headers and skip 4 bytes in datafile, noting position of this for update later
+        #    3) copy the next 296 bytes from datafile (unchanged)
+        #    4) write subset channel-count value and skip 4 bytes in datafile
+        #    5) append extended headers based on the channel ID.  Must read the first 4 bytes, determine if correct
+        #          Channel ID, repack first 4 bytes, write to disk, then copy remaining 62 (66-4) bytes
+        else:
+            subset_file.write(self.datafile.read(10))
+            bytes_in_headers = (
+                NSX_BASIC_HEADER_BYTES_22 + NSX_EXT_HEADER_BYTES_22 * num_elecs
+            )
+            num_pts_header_pos = bytes_in_headers + 5
+            subset_file.write(np.array(bytes_in_headers).astype(np.uint32).tobytes())
+            self.datafile.seek(4, 1)
+            subset_file.write(self.datafile.read(296))
+            subset_file.write(np.array(num_elecs).astype(np.uint32).tobytes())
+            self.datafile.seek(4, 1)
+
+            for i in range(len(self.extended_headers)):
+                h_type = self.datafile.read(2)
+                chan_id = self.datafile.read(2)
+                if unpack("<H", chan_id)[0] in elec_ids:
+                    subset_file.write(h_type)
+                    subset_file.write(chan_id)
+                    subset_file.write(self.datafile.read(62))
+                else:
+                    self.datafile.seek(62, 1)
+
+        # For all file types, loop through all data packets, extracting data based on page sizing
+        while self.datafile.tell() != ospath.getsize(self.datafile.name):
+            # pull and set data packet header info
+            if self.basic_header["FileSpec"] == "2.1":
+                packet_pts = (
+                    ospath.getsize(self.datafile.name) - self.datafile.tell()
+                ) / (DATA_BYTE_SIZE * self.basic_header["ChannelCount"])
+            else:
+                header_binary = self.datafile.read(1)
+                timestamp_binary = self.datafile.read(4)
+                packet_pts_binary = self.datafile.read(4)
+                packet_pts = unpack("<I", packet_pts_binary)[0]
+                if packet_pts == 0:
+                    continue
+
+                subset_file.write(header_binary)
+                subset_file.write(timestamp_binary)
+                subset_file.write(packet_pts_binary)
+
+            # get current file position and set loop parameters
+            datafile_pos = self.datafile.tell()
+            file_offset = datafile_pos
+            print(file_offset)
+            print(packet_pts)
+            mm_length = (
+                DATA_PAGING_SIZE // datafile_datapt_size
+            ) * datafile_datapt_size
+            num_loops = int(ceil(packet_pts * datafile_datapt_size / mm_length))
+            packet_read_pts = 0
+            subset_file_pkt_pts = 0
+
+            # Determine shape of data to map based on file sizing and position, map it, then append to file
+            for loop in range(num_loops):
+                if loop == 0:
+                    if num_loops == 1:
+                        num_pts = packet_pts
+                    else:
+                        num_pts = mm_length // datafile_datapt_size
+
+                else:
+                    file_offset += mm_length
+                    if loop == (num_loops - 1):
+                        num_pts = (
+                            (packet_pts * datafile_datapt_size) % mm_length
+                        ) // datafile_datapt_size
+                    else:
+                        num_pts = mm_length // datafile_datapt_size
+
+                shape = (int(num_pts), self.basic_header["ChannelCount"])
+                mm = np.memmap(
+                    self.datafile,
+                    dtype=np.int16,
+                    mode="r",
+                    offset=file_offset,
+                    shape=shape,
+                )
+                if elec_id_indices:
+                    mm = mm[:, elec_id_indices]
+                start_idx = 0
+
+                # Determine if we need to start an additional file
+                if (file_start_offset_size - subset_file.tell()) < DATA_PAGING_SIZE:
+                    # number of points we can possibly write to current subset file
+                    pts_can_add = (
+                        int(
+                            (file_start_offset_size - subset_file.tell())
+                            // (num_elecs * DATA_BYTE_SIZE)
+                        )
+                        + 1
+                    )
+                    stop_idx = start_idx + pts_can_add
+
+                    # If the pts remaining are less than exist in the data, we'll need an additional subset file
+                    while ((pts_can_add < num_pts) and (file_num < 3)):
+                        print(file_num)
+                        # We need to do this for the temporary file and the output file
+                        # Write pts to disk, set old file name, update pts in packet, and close last subset file
+                        if elec_id_indices:
+                            subset_file.write(
+                                np.array(mm[start_idx:stop_idx]).tobytes()
+                            )
+                        else:
+                            subset_file.write(mm[start_idx:stop_idx])
+                        prior_file_name = subset_file.name
+                        prior_file_pkt_pts = subset_file_pkt_pts + pts_can_add
+                        subset_file.close()
+
+                        # Only do the following if we are creating the output file
+                        # We need to copy header information from last subset file and adjust some headers.
+                        # For file spec 2.1, this is just the basic header.
+                        # For file spec 2.2 and above:
+                        #    1) copy basic and extended headers
+                        #    2) create data packet header with new timestamp and num data points (dummy numpts value)
+                        #    3) overwrite the number of data points in the old file last header packet with true value
+                        prior_file = open(prior_file_name, "rb+")
+                        numstr = "_out_st" + str(start_time_s) + "_en" + str(start_time_s+file_time_s) 
+                        if (file_num < 2):
+                            subset_file = open(file_name + numstr + file_ext, "wb")
+                        else:
+                            subset_file = open(file_name + numstr + "TEMP" + file_ext, "wb")
+                        print(
+                            "Writing subset file: " + ospath.split(subset_file.name)[1]
+                        )
+
+                        if self.basic_header["FileSpec"] == "2.1":
+                            subset_file.write(prior_file.read(32 + 4 * num_elecs))
+                        else:
+                            subset_file.write(prior_file.read(bytes_in_headers))
+                            subset_file.write(header_binary)
+                            timestamp_new = (
+                                unpack("<I", timestamp_binary)[0]
+                                + (packet_read_pts + pts_can_add)
+                                * self.basic_header["Period"]
+                            )
+                            subset_file.write(
+                                np.array(timestamp_new).astype(np.uint32).tobytes()
+                            )
+                            subset_file.write(
+                                np.array(num_pts - pts_can_add)
+                                .astype(np.uint32)
+                                .tobytes()
+                            )
+
+                            prior_file.seek(num_pts_header_pos, 0)
+                            prior_file.write(
+                                np.array(prior_file_pkt_pts).astype(np.uint32).tobytes()
+                            )
+
+                            num_pts_header_pos = bytes_in_headers + 5
+
+                            # Close old file and update parameters
+                            prior_file.close()
+                            packet_read_pts += pts_can_add
+                            start_idx += pts_can_add
+                            num_pts -= pts_can_add
+                            file_num += 1
+                            subset_file_pkt_pts = 0
+                            pausing = False
+
+                            pts_can_add = (
+                                int(
+                                    (file_size - subset_file.tell())
+                                    // (num_elecs * DATA_BYTE_SIZE)
+                                )
+                                + 1
+                            )
+                            stop_idx = start_idx + pts_can_add
+                        
+
+                # If no additional file needed, write remaining data to disk, update parameters, and clear memory map
+#                if elec_id_indices:
+#                    subset_file.write(np.array(mm[start_idx:]).tobytes())
+#                else:
+#                    subset_file.write(mm[start_idx:])
+#                packet_read_pts += num_pts
+#                subset_file_pkt_pts += num_pts
+                del mm
+
+            # Update num_pts header position for each packet, while saving last packet num_pts_header_pos for later
+            if self.basic_header["FileSpec"] != "2.1":
+                curr_hdr_num_pts_pos = num_pts_header_pos
+                num_pts_header_pos += (
+                    4 + subset_file_pkt_pts * num_elecs * DATA_BYTE_SIZE + 5
+                )
+
+            # Because memory map resets the file position, reset position in datafile
+            datafile_pos += (
+                self.basic_header["ChannelCount"] * packet_pts * DATA_BYTE_SIZE
+            )
+            self.datafile.seek(datafile_pos, 0)
+
+            # If using file_timing and there is pausing in data (multiple packets), let user know
+            if (
+                file_time_s
+                and not pausing
+                and (self.datafile.tell() != ospath.getsize(self.datafile.name))
+            ):
+                pausing = True
+                print(
+                    "\n*** Because of pausing in original datafile, this file may be slightly time shorter\n"
+                    "       than others, and will contain multiple data packets offset in time\n"
+                )
+
+            # Update last data header packet num data points accordingly (spec != 2.1)
+#            if self.basic_header["FileSpec"] != "2.1":
+#                subset_file_pos = subset_file.tell()
+#                subset_file.seek(curr_hdr_num_pts_pos, 0)
+#                subset_file.write(
+#                    np.array(subset_file_pkt_pts).astype(np.uint32).tobytes()
+#                )
+#                subset_file.seek(subset_file_pos, 0)
+
+        # Close subset file and return success
+#        subset_file.close()
         print("\n *** All subset files written to disk and closed ***")
         return "SUCCESS"
 
